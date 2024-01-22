@@ -16,6 +16,10 @@ const log = {
     rtpplaylog: debug('rtpplay')
 }
 
+function delay (timeout) {
+    return new Promise((res) => setTimeout(res, timeout))
+}
+
 class Request {
     headers = {}
     #session = {}
@@ -132,6 +136,10 @@ class Session extends Writable {
     context = { id: this.id.replace(/-/g, '') }
 
     write(chunk) {
+        if (chunk[0] === 0x24) {
+            return true
+        }
+
         const message = chunk.toString('utf-8')
         log.reqlog(message)
 
@@ -227,12 +235,14 @@ class RtspServer extends EventEmitter {
             const noneExist = medias.map(m => m.dumpFilePath)
                 .map(file => fs.existsSync(file))
                 .filter(exist => !exist)
-            if (noneExist.length > 0) {
+
+            const tcpdata = `${this.#root}${pathname}.tcpdata`
+            if (noneExist.length > 0 && !fs.existsSync(tcpdata)) {
                 res.notFound()
                 return
             }
 
-            Object.assign(req.session, { medias })
+            Object.assign(req.session, { medias, tcpdata })
             res.setBody(sdp, 'application/sdp')
         } catch (err) {
             log.applog('error occured when reading file: %s', err.message)
@@ -253,20 +263,35 @@ class RtspServer extends EventEmitter {
             return
         }
 
-        const transport = req.getHeader('Transport')
+        const transport = req.getHeader('Transport').split(';')
         log.reqlog('transport: %s', transport)
-        const clientPort = transport.split(';').filter(seg => seg.startsWith('client_port='))[0]
-        if (!clientPort) {
-            res.setStatus(400, 'Bad Request')
-            return
+        if (transport[0] === 'RTP/AVP/TCP') {
+            if (!fs.existsSync(req.session.tcpdata)) {
+                res.setStatus(461, 'Unsupported transport')
+                return
+            }
+            req.session.tcp = true
+            res.setHeader('Transport', `RTP/AVP/TCP;unicast;${transport[2]};ssrc=0;mode="play"`)
+        } else {
+            if (!fs.existsSync(media.dumpFilePath)) {
+                res.setStatus(461, 'Unsupported transport')
+                return
+            }
+
+            const clientPort = transport.filter(seg => seg.startsWith('client_port='))[0]
+            if (!clientPort) {
+                res.setStatus(400, 'Bad Request')
+                return
+            }
+            media.clientRtpPort = clientPort.split('=')[1].split('-')[0]
+
+            const serverPort = `server_port=${this.#rtpPort}-${this.#rtpPort + 1}`
+            media.serverRtpPort = this.#rtpPort
+            this.#rtpPort += 2
+
+            res.setHeader('Transport', `RTP/AVP/UDP;unicast;${clientPort};${serverPort};ssrc=0;mode="play"`)
         }
-        media.clientRtpPort = clientPort.split('=')[1].split('-')[0]
 
-        const serverPort = `server_port=${this.#rtpPort}-${this.#rtpPort + 1}`
-        media.serverRtpPort = this.#rtpPort
-        this.#rtpPort += 2
-
-        res.setHeader('Transport', `RTP/AVP/UDP;unicast;${clientPort};${serverPort};ssrc=0;mode="play"`)
         res.setHeader('Date', new Date().toUTCString())
         res.sessionId = `${req.session.id};timeout=60`
     }
@@ -285,25 +310,77 @@ class RtspServer extends EventEmitter {
 
     teardown(req, res) {
         log.applog('stop send data')
-        req.session.medias.forEach(media => media.rtpplay.kill('SIGINT'))
+        if (!req.session.medias) {
+            return
+        }
+        req.session.medias.filter(media => !!media.rtpplay).forEach(media => media.rtpplay.kill('SIGINT'))
     }
 
     #startRtpplay(req) {
-        for (const media of req.session.medias) {
-            const rtpplay = media.rtpplay = spawn('rtpplay', ['-T', '-f', media.dumpFilePath, '-s', media.serverRtpPort, `${req.socket.remoteAddress}/${media.clientRtpPort}`])
-            rtpplay.stdout.on('data', (chunk) => {
-                log.rtpplaylog('rtpplay log for %s: %s', media.media, chunk.toString('utf-8'))
-            })
-            rtpplay.stderr.on('data', (chunk) => {
-                log.rtpplaylog('rtpplay log error for %s: %s', media.media, chunk.toString('utf-8'))
-                rtpplay.kill('SIGINT')
-            })
-            rtpplay.on('close', (code, signal) => {
-                if (code !== 0) {
-                    log.rtpplaylog('rtpplay progress for %s exit, code=%s, signal=%s', media.media, code, signal)
+        if (req.session.tcp) {
+            const fileStream = fs.createReadStream(req.session.tcpdata)
+            let start = 0;
+            let found = false
+            fileStream.on('data', async (chunk) => {
+                for (let i = 0; i < chunk.length; i++) {
+                    if (chunk[i] === 0x24) {
+                        start += i;
+                        found = true
+                        break;
+                    }
                 }
-                req.socket.end()
+
+                if (found) {
+                    fileStream.destroy()
+                    const fd = fs.openSync(req.session.tcpdata, 'r')
+                    const buffer = Buffer.alloc(2048);
+                    let readPosition = start
+                    let read = 0
+                    let length = 0
+                    let lastTimestamp = 0
+                    while (true) {
+                        read = fs.readSync(fd, buffer, 0, 2, readPosition + 2);
+                        if (read < 2) {
+                            break
+                        }
+
+                        length = buffer.readUint16BE() + 4
+                        read = fs.readSync(fd, buffer, 0, length, readPosition)
+                        if (read === length && buffer[0] === 0x24) {
+                            readPosition += length
+
+                            const timestamp = buffer.readUint32BE(8)
+                            if (lastTimestamp !== timestamp && lastTimestamp !== 0) {
+                                lastTimestamp = timestamp;
+                                await delay(39)
+                            }
+                            lastTimestamp = timestamp
+                            req.socket.write(buffer.subarray(0, length))
+                        } else {
+                            throw new Error('Invalid position')
+                        }
+                    }
+                }
             })
+        } else {
+            for (const media of req.session.medias) {
+                log.applog(['rtpplay', ['-T', '-f', media.dumpFilePath, '-s', media.serverRtpPort, `${req.socket.remoteAddress}/${media.clientRtpPort}`]].join(' '))
+                const rtpplay = media.rtpplay = spawn('rtpplay', ['-T', '-f', media.dumpFilePath, '-s', media.serverRtport, `${req.socket.remoteAddress}/${media.clientRtpPort}`])
+                // const rtpplay = media.rtpplay = spawn('rtpplay', ['-T', '-f', media.dumpFilePath, `${req.socket.remoteAddress}/${media.clientRtpPort}`])
+                rtpplay.stdout.on('data', (chunk) => {
+                    log.rtpplaylog('rtpplay log for %s: %s', media.media, chunk.toString('utf-8'))
+                })
+                rtpplay.stderr.on('data', (chunk) => {
+                    log.rtpplaylog('rtpplay log error for %s: %s', media.media, chunk.toString('utf-8'))
+                    rtpplay.kill('SIGINT')
+                })
+                rtpplay.on('close', (code, signal) => {
+                    if (code !== 0) {
+                        log.rtpplaylog('rtpplay progress for %s exit, code=%s, signal=%s', media.media, code, signal)
+                    }
+                    req.socket.end()
+                })
+            }
         }
     }
 
