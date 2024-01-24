@@ -210,7 +210,7 @@ class RtspServer extends EventEmitter {
     }
 
     options(req, res) {
-        res.setHeader('Public', 'OPTIONS, DESCRIBE, SETUP, TEARDOWN, PLAY, PAUSE, GET_PARAMETER, SET_PARAMETER')
+        res.setHeader('Public', 'OPTIONS, DESCRIBE, SETUP, TEARDOWN, PLAY, GET_PARAMETER')
         res.setHeader('Date', new Date().toUTCString())
     }
 
@@ -413,9 +413,9 @@ class RtspServer extends EventEmitter {
 const argv = yargs(hideBin(process.argv))
     .usage('Usage: $0 [options]')
     .version(pkg.version)
-    .option('host', { alias: 'h', type: 'string', default: '127.0.0.1', description: 'host to bind on' })
+    .option('host', { alias: 'h', type: 'string', default: '0.0.0.0', description: 'host to bind on' })
     .option('port', { alias: 'p', type: 'number', default: 8554, description: 'port to bind on' })
-    .option('root', { alias: 'r', type: 'string', default: '.', description: 'media folder' })
+    .option('root', { alias: 'r', type: 'string', default: './media', description: 'media folder' })
     .option('verbose', { alias: 'v', type: 'boolean', default: false, description: 'run with verbose loging' })
     .showHelpOnFail(true)
     .parse()
